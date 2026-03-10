@@ -598,8 +598,40 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	// Forward non-self, non-group messages to webhook
-	if !msg.Info.IsFromMe && msg.Info.Chat.Server == "s.whatsapp.net" {
-		phone := msg.Info.Sender.User
+	// Accept both s.whatsapp.net and lid (WhatsApp's LID migration)
+	chatServer := msg.Info.Chat.Server
+	isDirectMessage := chatServer == "s.whatsapp.net" || chatServer == "lid"
+	if !msg.Info.IsFromMe && isDirectMessage {
+		// Debug: log JID info for troubleshooting
+		fmt.Printf("[webhook-debug] Chat: %s, Sender: %s, Server: %s\n",
+			msg.Info.Chat.String(), msg.Info.Sender.String(), chatServer)
+
+		// Resolve phone number from JIDs
+		phone := ""
+		if chatServer == "s.whatsapp.net" {
+			// Standard JID — Chat.User is the phone number
+			phone = msg.Info.Chat.User
+		} else if chatServer == "lid" {
+			// LID-based chat — resolve via whatsmeow's LID-PN store
+			pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), msg.Info.Sender)
+			if err == nil && pnJID.User != "" {
+				phone = pnJID.User
+				fmt.Printf("[webhook-debug] Resolved LID %s to phone %s\n",
+					msg.Info.Sender.String(), phone)
+			} else {
+				// Try with chat JID instead of sender JID
+				pnJID2, err2 := client.Store.LIDs.GetPNForLID(context.Background(), msg.Info.Chat)
+				if err2 == nil && pnJID2.User != "" {
+					phone = pnJID2.User
+					fmt.Printf("[webhook-debug] Resolved chat LID %s to phone %s\n",
+						msg.Info.Chat.String(), phone)
+				} else {
+					fmt.Printf("[webhook-debug] LID resolution failed for sender %s (err: %v) and chat %s (err: %v)\n",
+						msg.Info.Sender.String(), err, msg.Info.Chat.String(), err2)
+					return
+				}
+			}
+		}
 		if !strings.HasPrefix(phone, "+") {
 			phone = "+" + phone
 		}
