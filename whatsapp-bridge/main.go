@@ -1107,8 +1107,23 @@ func main() {
 	})
 
 	// Serve QR code via HTTP for easier scanning (behind auth)
+	// Also accepts ?token=<API_AUTH_TOKEN> query param for browser access
 	var latestQR string
-	http.HandleFunc("/qr", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/qr", func(w http.ResponseWriter, r *http.Request) {
+		apiToken := os.Getenv("API_AUTH_TOKEN")
+		if apiToken == "" {
+			http.Error(w, "Server misconfigured", http.StatusServiceUnavailable)
+			return
+		}
+		// Accept auth via Bearer header OR ?token= query param
+		authHeader := r.Header.Get("Authorization")
+		queryToken := r.URL.Query().Get("token")
+		headerOk := len(authHeader) > 0 && subtle.ConstantTimeCompare([]byte(authHeader), []byte("Bearer "+apiToken)) == 1
+		queryOk := len(queryToken) > 0 && subtle.ConstantTimeCompare([]byte(queryToken), []byte(apiToken)) == 1
+		if !headerOk && !queryOk {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
 		if latestQR == "" {
 			w.Header().Set("Content-Type", "text/html")
 			fmt.Fprint(w, `<!DOCTYPE html><html><body style="display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;background:#111;font-family:sans-serif">
@@ -1124,7 +1139,7 @@ func main() {
 			<p style="color:white;margin-top:20px;font-size:18px">Scan with WhatsApp → Linked Devices → Link a Device</p>
 			<p style="color:#888;font-size:14px">Page auto-refreshes every 30s</p>
 		</body></html>`, url.QueryEscape(latestQR))
-	}))
+	})
 
 	// Register API routes and start HTTP server BEFORE QR pairing
 	// so /qr and /health are accessible during pairing
