@@ -14,6 +14,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -1105,37 +1106,74 @@ func main() {
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
+	// Serve QR code via HTTP for easier scanning (behind auth)
+	var latestQR string
+	http.HandleFunc("/qr", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if latestQR == "" {
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<!DOCTYPE html><html><body style="display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;background:#111;font-family:sans-serif">
+				<p style="color:white;font-size:18px">No QR code available — already paired or waiting for new QR.</p>
+				<p style="color:#888;font-size:14px">Refresh in a few seconds.</p>
+			</body></html>`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta http-equiv="refresh" content="30"></head>
+			<body style="display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;background:#111;font-family:sans-serif">
+			<img src="https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=%s" style="border:8px solid white;border-radius:8px" />
+			<p style="color:white;margin-top:20px;font-size:18px">Scan with WhatsApp → Linked Devices → Link a Device</p>
+			<p style="color:#888;font-size:14px">Page auto-refreshes every 30s</p>
+		</body></html>`, url.QueryEscape(latestQR))
+	}))
+
+	// Register API routes and start HTTP server BEFORE QR pairing
+	// so /qr and /health are accessible during pairing
+	port := 8080
+	if p := os.Getenv("PORT"); p != "" {
+		if parsed, err := strconv.Atoi(p); err == nil {
+			port = parsed
+		}
+	}
+	startRESTServer(client, messageStore, port)
 
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
+		// No ID stored, need to pair with phone — retry QR loop indefinitely
+		for {
+			qrChan, _ := client.GetQRChannel(context.Background())
+			err = client.Connect()
+			if err != nil {
+				logger.Errorf("Failed to connect: %v, retrying in 10s...", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
 
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
+			paired := false
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					latestQR = evt.Code
+					fmt.Println("\nScan this QR code with your WhatsApp app:")
+					fmt.Printf("\n[QR RAW] %s\n\n", evt.Code)
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else if evt.Event == "success" {
+					latestQR = ""
+					paired = true
+					break
+				} else if evt.Event == "timeout" {
+					latestQR = ""
+					fmt.Println("\nQR code expired. Generating new one...")
+				}
+			}
+
+			if paired {
+				fmt.Println("\nSuccessfully connected and authenticated!")
 				break
 			}
-		}
 
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
+			// QR channel closed without success — disconnect and retry
+			client.Disconnect()
+			fmt.Println("QR session expired. Retrying in 5s...")
+			time.Sleep(5 * time.Second)
 		}
 	} else {
 		// Already logged in, just connect
@@ -1144,7 +1182,6 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		connected <- true
 	}
 
 	// Wait a moment for connection to stabilize
@@ -1156,15 +1193,6 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server (port configurable via PORT env var)
-	port := 8080
-	if p := os.Getenv("PORT"); p != "" {
-		if parsed, err := strconv.Atoi(p); err == nil {
-			port = parsed
-		}
-	}
-	startRESTServer(client, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
