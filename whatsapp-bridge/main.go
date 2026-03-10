@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
@@ -23,8 +25,6 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
-
-	"bytes"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -55,7 +55,7 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll("store", 0700); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
@@ -218,7 +218,7 @@ type WebhookPayload struct {
 func forwardToWebhook(payload WebhookPayload) {
 	webhookURL := os.Getenv("WEBHOOK_URL")
 	webhookSecret := os.Getenv("WEBHOOK_SECRET")
-	if webhookURL == "" {
+	if webhookURL == "" || webhookSecret == "" {
 		return
 	}
 
@@ -296,12 +296,13 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		apiToken := os.Getenv("API_AUTH_TOKEN")
 		if apiToken == "" {
-			// No token configured, allow all
-			next(w, r)
+			http.Error(w, "Server misconfigured: auth not set", http.StatusServiceUnavailable)
 			return
 		}
 		token := r.Header.Get("Authorization")
-		if token != "Bearer "+apiToken {
+		expected := []byte("Bearer " + apiToken)
+		actual := []byte(token)
+		if len(expected) != len(actual) || subtle.ConstantTimeCompare(expected, actual) != 1 {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -350,10 +351,19 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
-		// Read media file
-		mediaData, err := os.ReadFile(mediaPath)
+		// Sanitize path: resolve to absolute and ensure it's within store/ directory
+		absMedia, err := filepath.Abs(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err), ""
+			return false, "Invalid media path", ""
+		}
+		allowedDir, _ := filepath.Abs("store")
+		if !strings.HasPrefix(absMedia, allowedDir+string(os.PathSeparator)) {
+			return false, "Media path must be within the store directory", ""
+		}
+		// Read media file
+		mediaData, err := os.ReadFile(absMedia)
+		if err != nil {
+			return false, "Error reading media file", ""
 		}
 
 		// Determine media type and mime type based on file extension
@@ -782,7 +792,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -862,7 +872,7 @@ func downloadMediaBytes(client *whatsmeow.Client, messageStore *MessageStore, me
 		MediaType:     waMediaType,
 	}
 
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return nil, "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -886,6 +896,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB limit
 		var req SendMessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
@@ -926,6 +937,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB limit
 		var req DownloadMediaRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
@@ -978,37 +990,49 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Look up chat JID from the database
 		chatJID, err := messageStore.LookupChatJID(messageID)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Message not found: %v", err), http.StatusNotFound)
+			fmt.Printf("[api/media] Message lookup failed for %s: %v\n", messageID, err)
+			http.Error(w, "Message not found", http.StatusNotFound)
 			return
 		}
 
 		mediaData, mimeType, filename, err := downloadMediaBytes(client, messageStore, messageID, chatJID)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to download: %v", err), http.StatusInternalServerError)
+			fmt.Printf("[api/media] Download failed for %s: %v\n", messageID, err)
+			http.Error(w, "Failed to download media", http.StatusInternalServerError)
 			return
 		}
 
 		w.Header().Set("Content-Type", mimeType)
-		w.Header().Set("Content-Disposition", "attachment; filename="+filename)
+		safeFilename := strings.ReplaceAll(filepath.Base(filename), `"`, `_`)
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, safeFilename))
 		w.Header().Set("Content-Length", strconv.Itoa(len(mediaData)))
 		w.Write(mediaData)
 	}))
 
-	// Health check endpoint (no auth required)
+	// Health check endpoint (no auth required) - minimal info
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"connected": client.IsConnected(),
-			"uptime":    time.Since(startTime).String(),
-		})
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if client.IsConnected() {
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "disconnected"})
+		}
 	})
 
-	// Start the server
+	// Start the server with timeouts
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		server := &http.Server{
+			Addr:         serverAddr,
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 60 * time.Second,
+			IdleTimeout:  120 * time.Second,
+		}
+		if err := server.ListenAndServe(); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -1023,19 +1047,19 @@ func main() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll("store", 0700); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -1207,7 +1231,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -1222,7 +1246,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
