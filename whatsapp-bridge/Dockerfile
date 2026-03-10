@@ -11,13 +11,12 @@ RUN CGO_ENABLED=1 go build -o whatsapp-bridge .
 
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates
-RUN adduser -D -s /bin/sh appuser
 WORKDIR /app
 
 COPY --from=builder /app/whatsapp-bridge .
-RUN mkdir -p /app/store && chown appuser:appuser /app/store
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
 
-USER appuser
 EXPOSE 8080
 
-CMD ["./whatsapp-bridge"]
+CMD ["./entrypoint.sh"]
