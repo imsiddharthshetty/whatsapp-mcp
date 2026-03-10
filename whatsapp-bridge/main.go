@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -13,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +34,8 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+var startTime = time.Now()
 
 // Message represents a chat message for our client
 type Message struct {
@@ -191,8 +197,116 @@ func extractTextContent(msg *waProto.Message) string {
 
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	MessageID string `json:"message_id,omitempty"`
+}
+
+// WebhookPayload is the JSON payload sent to the configured webhook URL
+type WebhookPayload struct {
+	MessageID string `json:"message_id"`
+	From      string `json:"from"`
+	Timestamp int64  `json:"timestamp"`
+	Text      string `json:"text,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+	MediaID   string `json:"media_id,omitempty"`
+	MimeType  string `json:"mime_type,omitempty"`
+	Filename  string `json:"filename,omitempty"`
+}
+
+// forwardToWebhook sends an inbound message to the configured webhook URL
+func forwardToWebhook(payload WebhookPayload) {
+	webhookURL := os.Getenv("WEBHOOK_URL")
+	webhookSecret := os.Getenv("WEBHOOK_SECRET")
+	if webhookURL == "" {
+		return
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Printf("[webhook] Failed to marshal payload: %v\n", err)
+		return
+	}
+
+	// Compute HMAC-SHA256 signature
+	mac := hmac.New(sha256.New, []byte(webhookSecret))
+	mac.Write(body)
+	signature := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	// Retry up to 3 times with exponential backoff
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*attempt) * time.Second)
+		}
+
+		req, err := http.NewRequest("POST", webhookURL, bytes.NewReader(body))
+		if err != nil {
+			fmt.Printf("[webhook] Failed to create request: %v\n", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Whatsmeow-Signature", signature)
+
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("[webhook] Attempt %d failed: %v\n", attempt+1, err)
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			fmt.Printf("[webhook] Forwarded message %s from %s (status %d)\n", payload.MessageID, payload.From, resp.StatusCode)
+			return
+		}
+		fmt.Printf("[webhook] Attempt %d got status %d\n", attempt+1, resp.StatusCode)
+	}
+	fmt.Printf("[webhook] Failed to forward message %s after 3 attempts\n", payload.MessageID)
+}
+
+// getMimeTypeFromMediaType returns a MIME type string for the given media type
+func getMimeTypeFromMediaType(msg *waProto.Message, mediaType string) string {
+	switch mediaType {
+	case "image":
+		if img := msg.GetImageMessage(); img != nil && img.Mimetype != nil {
+			return *img.Mimetype
+		}
+		return "image/jpeg"
+	case "document":
+		if doc := msg.GetDocumentMessage(); doc != nil && doc.Mimetype != nil {
+			return *doc.Mimetype
+		}
+		return "application/octet-stream"
+	case "video":
+		if vid := msg.GetVideoMessage(); vid != nil && vid.Mimetype != nil {
+			return *vid.Mimetype
+		}
+		return "video/mp4"
+	case "audio":
+		if aud := msg.GetAudioMessage(); aud != nil && aud.Mimetype != nil {
+			return *aud.Mimetype
+		}
+		return "audio/ogg"
+	}
+	return ""
+}
+
+// authMiddleware validates bearer token on API endpoints
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		apiToken := os.Getenv("API_AUTH_TOKEN")
+		if apiToken == "" {
+			// No token configured, allow all
+			next(w, r)
+			return
+		}
+		token := r.Header.Get("Authorization")
+		if token != "Bearer "+apiToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -203,14 +317,17 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", ""
 	}
 
 	// Create JID for recipient
 	var recipientJID types.JID
 	var err error
+
+	// Strip + prefix from E.164 numbers
+	recipient = strings.TrimPrefix(recipient, "+")
 
 	// Check if recipient is a JID
 	isJID := strings.Contains(recipient, "@")
@@ -219,7 +336,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), ""
 		}
 	} else {
 		// Create JID from phone number
@@ -236,7 +353,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), ""
 		}
 
 		// Determine media type and mime type based on file extension
@@ -285,7 +402,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), ""
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -315,7 +432,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), ""
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -362,13 +479,13 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), ""
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), resp.ID
 }
 
 // Extract media info from a message
@@ -467,6 +584,30 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+	}
+
+	// Forward non-self, non-group messages to webhook
+	if !msg.Info.IsFromMe && msg.Info.Chat.Server == "s.whatsapp.net" {
+		phone := msg.Info.Sender.User
+		if !strings.HasPrefix(phone, "+") {
+			phone = "+" + phone
+		}
+
+		mimeType := getMimeTypeFromMediaType(msg.Message, mediaType)
+
+		payload := WebhookPayload{
+			MessageID: msg.Info.ID,
+			From:      phone,
+			Timestamp: msg.Info.Timestamp.Unix(),
+			Text:      content,
+			MediaType: mediaType,
+			Filename:  filename,
+			MimeType:  mimeType,
+		}
+		if mediaType != "" {
+			payload.MediaID = msg.Info.ID
+		}
+		go forwardToWebhook(payload)
 	}
 }
 
@@ -675,24 +816,82 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// downloadMediaBytes downloads media and returns the raw bytes instead of saving to disk
+func downloadMediaBytes(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) ([]byte, string, string, error) {
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err := messageStore.GetMediaInfo(messageID, chatJID)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to find message: %v", err)
+	}
+
+	if mediaType == "" {
+		return nil, "", "", fmt.Errorf("not a media message")
+	}
+
+	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
+		return nil, "", "", fmt.Errorf("incomplete media information for download")
+	}
+
+	directPath := extractDirectPathFromURL(url)
+
+	var waMediaType whatsmeow.MediaType
+	var mimeType string
+	switch mediaType {
+	case "image":
+		waMediaType = whatsmeow.MediaImage
+		mimeType = "image/jpeg"
+	case "video":
+		waMediaType = whatsmeow.MediaVideo
+		mimeType = "video/mp4"
+	case "audio":
+		waMediaType = whatsmeow.MediaAudio
+		mimeType = "audio/ogg"
+	case "document":
+		waMediaType = whatsmeow.MediaDocument
+		mimeType = "application/octet-stream"
+	default:
+		return nil, "", "", fmt.Errorf("unsupported media type: %s", mediaType)
+	}
+
+	downloader := &MediaDownloader{
+		URL:           url,
+		DirectPath:    directPath,
+		MediaKey:      mediaKey,
+		FileLength:    fileLength,
+		FileSHA256:    fileSHA256,
+		FileEncSHA256: fileEncSHA256,
+		MediaType:     waMediaType,
+	}
+
+	mediaData, err := client.Download(downloader)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to download media: %v", err)
+	}
+
+	return mediaData, mimeType, filename, nil
+}
+
+// lookupChatJIDForMessage finds the chat JID for a given message ID
+func (store *MessageStore) LookupChatJID(messageID string) (string, error) {
+	var chatJID string
+	err := store.db.QueryRow("SELECT chat_jid FROM messages WHERE id = ? LIMIT 1", messageID).Scan(&chatJID)
+	return chatJID, err
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
+	http.HandleFunc("/api/send", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		// Parse the request body
 		var req SendMessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
 			return
 		}
 
-		// Validate request
 		if req.Recipient == "" {
 			http.Error(w, "Recipient is required", http.StatusBadRequest)
 			return
@@ -705,58 +904,48 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message, messageID := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
 
-		// Set appropriate status code
+		w.Header().Set("Content-Type", "application/json")
 		if !success {
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 
-		// Send response
 		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
+			Success:   success,
+			Message:   message,
+			MessageID: messageID,
 		})
-	})
+	}))
 
-	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
+	// Handler for downloading media (original - returns file path)
+	http.HandleFunc("/api/download", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		// Parse the request body
 		var req DownloadMediaRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
 			return
 		}
 
-		// Validate request
 		if req.MessageID == "" || req.ChatJID == "" {
 			http.Error(w, "Message ID and Chat JID are required", http.StatusBadRequest)
 			return
 		}
 
-		// Download the media
 		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
 
-		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
-		// Handle download result
 		if !success || err != nil {
 			errMsg := "Unknown error"
 			if err != nil {
 				errMsg = err.Error()
 			}
-
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(DownloadMediaResponse{
 				Success: false,
@@ -765,12 +954,52 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		// Send successful response
 		json.NewEncoder(w).Encode(DownloadMediaResponse{
 			Success:  true,
 			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
 			Filename: filename,
 			Path:     path,
+		})
+	}))
+
+	// Handler for media download as raw bytes (for remote consumers like Vercel)
+	http.HandleFunc("/api/media", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		messageID := r.URL.Query().Get("messageId")
+		if messageID == "" {
+			http.Error(w, "messageId is required", http.StatusBadRequest)
+			return
+		}
+
+		// Look up chat JID from the database
+		chatJID, err := messageStore.LookupChatJID(messageID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Message not found: %v", err), http.StatusNotFound)
+			return
+		}
+
+		mediaData, mimeType, filename, err := downloadMediaBytes(client, messageStore, messageID, chatJID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to download: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", mimeType)
+		w.Header().Set("Content-Disposition", "attachment; filename="+filename)
+		w.Header().Set("Content-Length", strconv.Itoa(len(mediaData)))
+		w.Write(mediaData)
+	}))
+
+	// Health check endpoint (no auth required)
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"connected": client.IsConnected(),
+			"uptime":    time.Since(startTime).String(),
 		})
 	})
 
@@ -778,7 +1007,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
-	// Run server in a goroutine so it doesn't block
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
@@ -905,8 +1133,14 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server (port configurable via PORT env var)
+	port := 8080
+	if p := os.Getenv("PORT"); p != "" {
+		if parsed, err := strconv.Atoi(p); err == nil {
+			port = parsed
+		}
+	}
+	startRESTServer(client, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
